@@ -1,9 +1,16 @@
 import os
-import html
-import json
+import threading
 import requests
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from flask import Flask, jsonify, request
+from flask_cors import CORS
+
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    WebAppInfo,
+)
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -11,45 +18,49 @@ from telegram.ext import (
     ContextTypes,
 )
 
-# =========================
+
+# =========================================================
 # 环境变量
-# =========================
+# =========================================================
+
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 
-# Railway 当前保存 Oddiwire API Key 的变量名
+# 继续使用你 Railway 现在已经设置好的变量名
 ODDIWIRE_API_KEY = os.environ.get("FIELDFUNDED_API_KEY", "")
+
+# 你现在的 GitHub Pages 小程序
+MINI_APP_URL = os.environ.get(
+    "MINI_APP_URL",
+    "https://tj6235138-debug.github.io/jiangtian-esports/",
+)
+
+# 后面可以在 Railway Variables 里配置
+SUPPORT_URL = os.environ.get("SUPPORT_URL", "")
+RECHARGE_URL = os.environ.get("RECHARGE_URL", "")
 
 ODDIWIRE_BASE_URL = "https://oddiwire.com"
 
-
-# =========================
-# 主菜单
-# =========================
-def main_keyboard():
-    keyboard = [
-        [
-            InlineKeyboardButton("🎮 实时比赛", callback_data="live"),
-            InlineKeyboardButton("📅 赛前比赛", callback_data="prematch"),
-        ],
-        [
-            InlineKeyboardButton("🔥 热门赛事", callback_data="hot"),
-            InlineKeyboardButton("🔄 刷新数据", callback_data="live"),
-        ],
-        [
-            InlineKeyboardButton("🔌 API状态", callback_data="api_status"),
-            InlineKeyboardButton("ℹ️ 关于姜天电竞", callback_data="about"),
-        ],
-    ]
-
-    return InlineKeyboardMarkup(keyboard)
+# Railway 会自动提供 PORT
+PORT = int(os.environ.get("PORT", "8080"))
 
 
-# =========================
-# Oddiwire 通用请求
-# =========================
+# =========================================================
+# Flask Web API
+# =========================================================
+
+web_app = Flask(__name__)
+
+# 允许 GitHub Pages 小程序访问 API
+CORS(web_app)
+
+
+# =========================================================
+# Oddiwire 请求
+# =========================================================
+
 def oddiwire_request(path, params=None):
     if not ODDIWIRE_API_KEY:
-        return None, "Railway 中没有找到 Oddiwire API Key"
+        return None, "Oddiwire API Key 未配置", 500
 
     url = f"{ODDIWIRE_BASE_URL}{path}"
 
@@ -66,504 +77,493 @@ def oddiwire_request(path, params=None):
             timeout=20,
         )
 
-        # 调试日志，不打印 API Key
         print("=" * 60)
         print("ODDIWIRE REQUEST:", path)
         print("ODDIWIRE STATUS:", response.status_code)
-        print("ODDIWIRE RESPONSE:", response.text[:3000])
         print("=" * 60)
 
         if response.status_code == 401:
-            return None, "Oddiwire API Key 无效或没有权限"
+            return None, "Oddiwire API Key 无效", 401
 
         if response.status_code == 403:
-            return None, "Oddiwire 拒绝访问，请检查套餐/API权限"
-
-        if response.status_code == 404:
-            return None, f"Oddiwire 接口不存在：{path}"
+            return None, "Oddiwire API 没有访问权限", 403
 
         if response.status_code == 429:
-            return None, "Oddiwire 请求额度已达到限制，请稍后再试"
+            return None, "Oddiwire API 请求过于频繁", 429
 
         if response.status_code >= 500:
-            return None, f"Oddiwire服务器异常：HTTP {response.status_code}"
+            return (
+                None,
+                f"Oddiwire 服务异常 HTTP {response.status_code}",
+                502,
+            )
 
         response.raise_for_status()
 
-        try:
-            return response.json(), None
-        except Exception:
-            return None, "Oddiwire 返回的不是有效 JSON 数据"
+        return response.json(), None, 200
 
     except requests.exceptions.Timeout:
-        return None, "连接 Oddiwire 超时"
+        return None, "Oddiwire API 请求超时", 504
 
     except requests.exceptions.ConnectionError:
-        return None, "无法连接 Oddiwire"
+        return None, "无法连接 Oddiwire API", 502
 
     except Exception as e:
         print("ODDIWIRE ERROR:", repr(e))
-        return None, f"API连接失败：{str(e)}"
+        return None, str(e), 500
 
 
-# =========================
-# API 状态
-# =========================
-def get_api_status():
-    return oddiwire_request("/v1/me")
+# =========================================================
+# API 首页
+# =========================================================
+
+@web_app.route("/", methods=["GET"])
+def api_home():
+    return jsonify(
+        {
+            "ok": True,
+            "name": "姜天电竞 API",
+            "status": "online",
+        }
+    )
 
 
-# =========================
-# 获取赛事
-# =========================
-def get_fixtures(event_type="live", limit=10):
+# =========================================================
+# 健康检查
+# =========================================================
+
+@web_app.route("/api/health", methods=["GET"])
+def api_health():
+    return jsonify(
+        {
+            "ok": True,
+            "service": "jiangtian-esports",
+            "oddiwire_configured": bool(ODDIWIRE_API_KEY),
+        }
+    )
+
+
+# =========================================================
+# 获取比赛
+#
+# 使用方法：
+#
+# /api/fixtures?event_type=live
+# /api/fixtures?event_type=prematch
+#
+# 可选：
+# &sport=CS2
+# &tier=1
+# &limit=100
+# =========================================================
+
+@web_app.route("/api/fixtures", methods=["GET"])
+def api_fixtures():
+
+    event_type = request.args.get(
+        "event_type",
+        "live",
+    ).lower()
+
+    if event_type not in ("live", "prematch"):
+        return jsonify(
+            {
+                "ok": False,
+                "error": "event_type 必须是 live 或 prematch",
+            }
+        ), 400
+
+    sport = request.args.get(
+        "sport",
+        "",
+    ).strip()
+
+    try:
+        tier = int(
+            request.args.get(
+                "tier",
+                "1",
+            )
+        )
+    except ValueError:
+        tier = 1
+
+    try:
+        limit = int(
+            request.args.get(
+                "limit",
+                "100",
+            )
+        )
+    except ValueError:
+        limit = 100
+
+    # 防止前端一次请求过多
+    limit = max(
+        1,
+        min(limit, 1000),
+    )
+
     params = {
         "event_type": event_type,
-        "tier": 1,
+        "tier": tier,
         "limit": limit,
     }
 
-    return oddiwire_request(
+    if sport:
+        params["sport"] = sport
+
+    data, error, status = oddiwire_request(
         "/v1/fixtures",
         params=params,
     )
 
+    if error:
+        return jsonify(
+            {
+                "ok": False,
+                "error": error,
+            }
+        ), status
 
-# =========================
-# 提取赛事
-# =========================
-def extract_fixtures(data):
-    print("FIXTURE DATA TYPE:", type(data).__name__)
+    # Oddiwire 当前实际结构：
+    #
+    # {
+    #   "count": ...,
+    #   "events": [...]
+    # }
 
-    # Oddiwire 偶尔可能直接返回数组
+    events = []
+
     if isinstance(data, list):
-        print("FIXTURE LIST COUNT:", len(data))
-        return data
 
-    if isinstance(data, dict):
-        print(
-            "FIXTURE TOP LEVEL KEYS:",
-            list(data.keys()),
-        )
+        events = data
 
-        # Oddiwire 当前实际返回：
-        # {
-        #     "count": ...,
-        #     "events": [...]
-        # }
-        for key in (
+    elif isinstance(data, dict):
+
+        possible_events = data.get(
             "events",
-            "fixtures",
-            "data",
-            "results",
-            "items",
-        ):
-            value = data.get(key)
+            [],
+        )
 
-            if isinstance(value, list):
-                print(
-                    f"FIXTURE LIST FOUND: {key}",
-                    len(value),
-                )
-                return value
+        if isinstance(possible_events, list):
+            events = possible_events
 
-            if isinstance(value, dict):
-                for subkey in (
-                    "events",
-                    "fixtures",
-                    "results",
-                    "items",
-                ):
-                    subvalue = value.get(subkey)
+        # 兼容未来可能出现的其它结构
+        if not events:
 
-                    if isinstance(subvalue, list):
-                        print(
-                            f"FIXTURE LIST FOUND: {key}.{subkey}",
-                            len(subvalue),
-                        )
-                        return subvalue
+            for key in (
+                "fixtures",
+                "results",
+                "items",
+            ):
 
-    print("NO FIXTURE LIST FOUND")
-    return []
+                value = data.get(key)
 
+                if isinstance(value, list):
+                    events = value
+                    break
 
-# =========================
-# 格式化单场比赛
-# =========================
-def format_fixture(fixture):
-    if not isinstance(fixture, dict):
-        return ""
-
-    sport = (
-        fixture.get("sport")
-        or fixture.get("game")
-        or "ESPORTS"
+    return jsonify(
+        {
+            "ok": True,
+            "event_type": event_type,
+            "sport": sport or "ALL",
+            "count": len(events),
+            "events": events,
+        }
     )
 
-    competition = fixture.get("competition", {})
 
-    if isinstance(competition, dict):
-        league = (
-            competition.get("name")
-            or competition.get("title")
-            or "未知赛事"
-        )
-    else:
-        league = str(competition or "未知赛事")
+# =========================================================
+# 单场比赛详情
+# =========================================================
 
-    competitors = fixture.get("competitors", [])
+@web_app.route(
+    "/api/fixtures/<fixture_id>",
+    methods=["GET"],
+)
+def api_fixture_detail(fixture_id):
 
-    team1 = "队伍A"
-    team2 = "队伍B"
-
-    if isinstance(competitors, list):
-        if len(competitors) >= 1:
-            first = competitors[0]
-
-            if isinstance(first, dict):
-                team1 = (
-                    first.get("name")
-                    or first.get("title")
-                    or team1
-                )
-            else:
-                team1 = str(first)
-
-        if len(competitors) >= 2:
-            second = competitors[1]
-
-            if isinstance(second, dict):
-                team2 = (
-                    second.get("name")
-                    or second.get("title")
-                    or team2
-                )
-            else:
-                team2 = str(second)
-
-    phase = fixture.get("phase", "")
-    status = fixture.get("status", "")
-
-    text = (
-        f"🎮 <b>{html.escape(str(sport))}</b>\n"
-        f"🏆 {html.escape(str(league))}\n"
-        f"⚔️ <b>{html.escape(str(team1))}</b>\n"
-        f"🆚 <b>{html.escape(str(team2))}</b>\n"
+    data, error, status = oddiwire_request(
+        f"/v1/fixtures/{fixture_id}"
     )
 
-    if phase:
-        text += (
-            f"📡 状态："
-            f"{html.escape(str(phase))}\n"
-        )
+    if error:
+        return jsonify(
+            {
+                "ok": False,
+                "error": error,
+            }
+        ), status
 
-    if status:
-        text += (
-            f"📊 状态："
-            f"{html.escape(str(status))}\n"
-        )
+    return jsonify(
+        {
+            "ok": True,
+            "event": data,
+        }
+    )
 
-    markets = fixture.get("markets", [])
 
-    if isinstance(markets, list) and markets:
-        text += "\n💹 <b>赔率盘口</b>\n"
+# =========================================================
+# API Key 状态
+# =========================================================
 
-        shown = 0
+@web_app.route("/api/status", methods=["GET"])
+def api_status():
 
-        for market in markets:
-            if shown >= 3:
-                break
+    data, error, status = oddiwire_request(
+        "/v1/me"
+    )
 
-            if not isinstance(market, dict):
-                continue
+    if error:
+        return jsonify(
+            {
+                "ok": False,
+                "error": error,
+            }
+        ), status
 
-            market_name = (
-                market.get("market")
-                or market.get("name")
-                or market.get("canonical")
-                or "盘口"
+    # 不把敏感 Key 返回给前端
+    return jsonify(
+        {
+            "ok": True,
+            "message": "Oddiwire API 正常",
+        }
+    )
+
+
+# =========================================================
+# Telegram 主菜单
+# =========================================================
+
+def telegram_keyboard():
+
+    keyboard = [
+        [
+            InlineKeyboardButton(
+                "🎮 进入姜天电竞",
+                web_app=WebAppInfo(
+                    url=MINI_APP_URL
+                ),
             )
+        ],
+        [
+            InlineKeyboardButton(
+                "💰 充值",
+                callback_data="recharge",
+            ),
+            InlineKeyboardButton(
+                "👤 联系客服",
+                callback_data="support",
+            ),
+        ],
+    ]
 
-            selections = market.get("selections", [])
-
-            if not isinstance(selections, list):
-                continue
-
-            if not selections:
-                continue
-
-            text += (
-                f"\n• "
-                f"{html.escape(str(market_name))}\n"
-            )
-
-            for selection in selections[:4]:
-                if not isinstance(selection, dict):
-                    continue
-
-                side = (
-                    selection.get("name")
-                    or selection.get("side")
-                    or selection.get("selection")
-                    or "-"
-                )
-
-                line = selection.get("line")
-                price = selection.get("price")
-
-                line_text = ""
-
-                if line is not None:
-                    line_text = f" {line}"
-
-                if price is not None:
-                    text += (
-                        f"  └ "
-                        f"{html.escape(str(side))}"
-                        f"{html.escape(str(line_text))}"
-                        f"  @ "
-                        f"{html.escape(str(price))}\n"
-                    )
-
-            shown += 1
-
-    return text
+    return InlineKeyboardMarkup(
+        keyboard
+    )
 
 
-# =========================
+# =========================================================
 # /start
-# =========================
+# =========================================================
+
 async def start(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
+
     user = update.effective_user
 
-    name = html.escape(
+    name = (
         user.first_name
         or user.username
         or "玩家"
     )
 
     text = (
-        f"👋 欢迎 <b>{name}</b> 来到\n\n"
-        f"🎮 <b>姜天电竞</b>\n"
-        f"━━━━━━━━━━━━━━\n"
-        f"⚡ 实时电竞赛事\n"
-        f"📊 实时赔率数据\n"
-        f"🔥 热门比赛查询\n"
-        f"━━━━━━━━━━━━━━\n\n"
-        f"请选择下方功能："
+        f"👋 欢迎 {name}\n\n"
+        "🎮 姜天电竞\n"
+        "━━━━━━━━━━━━━━\n"
+        "⚡ 电竞赛事\n"
+        "📊 实时赔率\n"
+        "🎯 赛事中心\n"
+        "━━━━━━━━━━━━━━\n\n"
+        "点击下方按钮进入姜天电竞。"
     )
 
     await update.message.reply_text(
         text,
-        parse_mode="HTML",
-        reply_markup=main_keyboard(),
+        reply_markup=telegram_keyboard(),
     )
 
 
-# =========================
-# API 状态
-# =========================
-async def show_api_status(query):
-    await query.answer()
+# =========================================================
+# Telegram 按钮
+# =========================================================
 
-    await query.edit_message_text(
-        "🔌 正在检查 Oddiwire API..."
-    )
-
-    data, error = get_api_status()
-
-    if error:
-        await query.edit_message_text(
-            f"❌ <b>API连接失败</b>\n\n"
-            f"{html.escape(error)}",
-            parse_mode="HTML",
-            reply_markup=main_keyboard(),
-        )
-        return
-
-    print(
-        "API STATUS DATA:",
-        json.dumps(
-            data,
-            ensure_ascii=False,
-        )[:3000],
-    )
-
-    text = (
-        "✅ <b>Oddiwire API连接成功</b>\n"
-        "━━━━━━━━━━━━━━\n\n"
-        "🔑 API Key：已识别\n"
-        "🌐 API：正常响应\n\n"
-        "现在可以查询实时比赛和赛前比赛。"
-    )
-
-    await query.edit_message_text(
-        text,
-        parse_mode="HTML",
-        reply_markup=main_keyboard(),
-    )
-
-
-# =========================
-# 显示赛事
-# =========================
-async def show_fixtures(
-    query,
-    event_type,
-):
-    await query.answer()
-
-    await query.edit_message_text(
-        "⏳ 正在从 Oddiwire 获取最新数据..."
-    )
-
-    data, error = get_fixtures(
-        event_type=event_type,
-        limit=10,
-    )
-
-    if error:
-        await query.edit_message_text(
-            f"⚠️ <b>数据获取失败</b>\n\n"
-            f"{html.escape(error)}",
-            parse_mode="HTML",
-            reply_markup=main_keyboard(),
-        )
-        return
-
-    fixtures = extract_fixtures(data)
-
-    if not fixtures:
-        await query.edit_message_text(
-            "📭 <b>当前没有找到对应赛事</b>\n\n"
-            "Oddiwire API 已正常连接，"
-            "可以稍后点击刷新重新查询。",
-            parse_mode="HTML",
-            reply_markup=main_keyboard(),
-        )
-        return
-
-    if event_type == "live":
-        title = "🔴 <b>实时比赛</b>"
-    else:
-        title = "📅 <b>赛前比赛</b>"
-
-    text = (
-        title
-        + "\n━━━━━━━━━━━━━━\n\n"
-    )
-
-    for fixture in fixtures[:5]:
-        fixture_text = format_fixture(fixture)
-
-        if fixture_text:
-            text += fixture_text
-            text += "\n━━━━━━━━━━━━━━\n"
-
-    if len(text) > 3900:
-        text = (
-            text[:3900]
-            + "\n\n……"
-        )
-
-    await query.edit_message_text(
-        text,
-        parse_mode="HTML",
-        reply_markup=main_keyboard(),
-    )
-
-
-# =========================
-# 按钮回调
-# =========================
 async def callback(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
+
     query = update.callback_query
 
-    if query.data == "live":
-        await show_fixtures(
-            query,
-            "live",
-        )
+    await query.answer()
 
-    elif query.data == "prematch":
-        await show_fixtures(
-            query,
-            "prematch",
-        )
+    # ---------------------
+    # 充值
+    # ---------------------
 
-    elif query.data == "hot":
-        await show_fixtures(
-            query,
-            "live",
-        )
+    if query.data == "recharge":
 
-    elif query.data == "api_status":
-        await show_api_status(query)
+        if RECHARGE_URL:
 
-    elif query.data == "about":
-        await query.answer()
+            keyboard = InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton(
+                            "💰 打开充值入口",
+                            url=RECHARGE_URL,
+                        )
+                    ],
+                    [
+                        InlineKeyboardButton(
+                            "🎮 进入姜天电竞",
+                            web_app=WebAppInfo(
+                                url=MINI_APP_URL
+                            ),
+                        )
+                    ],
+                ]
+            )
 
-        text = (
-            "🎮 <b>姜天电竞</b>\n"
-            "━━━━━━━━━━━━━━\n\n"
-            "⚡ 电竞赛事数据\n"
-            "📊 实时赔率盘口\n"
-            "🎯 赛前与滚球赛事\n\n"
-            "📡 数据接口：Oddiwire\n\n"
-            "赔率信息仅作数据展示。"
-        )
+            await query.message.reply_text(
+                "💰 请选择充值入口：",
+                reply_markup=keyboard,
+            )
 
-        await query.edit_message_text(
-            text,
-            parse_mode="HTML",
-            reply_markup=main_keyboard(),
-        )
+        else:
+
+            await query.message.reply_text(
+                "💰 充值入口暂未配置。\n\n"
+                "如需帮助，请联系在线客服。"
+            )
+
+    # ---------------------
+    # 客服
+    # ---------------------
+
+    elif query.data == "support":
+
+        if SUPPORT_URL:
+
+            keyboard = InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton(
+                            "👤 联系在线客服",
+                            url=SUPPORT_URL,
+                        )
+                    ]
+                ]
+            )
+
+            await query.message.reply_text(
+                "👤 点击下方按钮联系在线客服：",
+                reply_markup=keyboard,
+            )
+
+        else:
+
+            await query.message.reply_text(
+                "👤 客服入口暂未配置。"
+            )
 
 
-# =========================
-# 启动机器人
-# =========================
-def main():
-    if not ODDIWIRE_API_KEY:
-        print(
-            "WARNING: "
-            "FIELDFUNDED_API_KEY 未配置"
-        )
-    else:
-        print(
-            "Oddiwire API Key 已从 Railway 读取"
-        )
+# =========================================================
+# 启动 Flask
+# =========================================================
 
-    app = (
+def run_web_server():
+
+    print(
+        f"姜天电竞 Web API 启动，PORT={PORT}"
+    )
+
+    web_app.run(
+        host="0.0.0.0",
+        port=PORT,
+        debug=False,
+        use_reloader=False,
+    )
+
+
+# =========================================================
+# 启动 Telegram Bot
+# =========================================================
+
+def run_telegram_bot():
+
+    print(
+        "姜天电竞 Telegram Bot 启动"
+    )
+
+    application = (
         Application.builder()
         .token(BOT_TOKEN)
         .build()
     )
 
-    app.add_handler(
+    application.add_handler(
         CommandHandler(
             "start",
             start,
         )
     )
 
-    app.add_handler(
+    application.add_handler(
         CallbackQueryHandler(
             callback,
         )
     )
 
-    print("姜天电竞 Telegram Bot 已启动")
-
-    app.run_polling(
+    application.run_polling(
         allowed_updates=Update.ALL_TYPES
     )
+
+
+# =========================================================
+# MAIN
+# =========================================================
+
+def main():
+
+    print("=" * 60)
+    print("姜天电竞系统启动")
+    print("=" * 60)
+
+    if ODDIWIRE_API_KEY:
+        print("Oddiwire API Key：已配置")
+    else:
+        print("WARNING：Oddiwire API Key 未配置")
+
+    print(
+        "Mini App:",
+        MINI_APP_URL,
+    )
+
+    # Flask API 放到后台线程
+    web_thread = threading.Thread(
+        target=run_web_server,
+        daemon=True,
+    )
+
+    web_thread.start()
+
+    # Telegram Bot 保持主线程运行
+    run_telegram_bot()
 
 
 if __name__ == "__main__":
