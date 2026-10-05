@@ -16,7 +16,7 @@ from telegram.ext import (
 # =========================
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 
-# Railway 目前保存 Oddiwire Key 的变量名称
+# Railway 当前保存 Oddiwire API Key 的变量名
 ODDIWIRE_API_KEY = os.environ.get("FIELDFUNDED_API_KEY", "")
 
 ODDIWIRE_BASE_URL = "https://oddiwire.com"
@@ -66,8 +66,7 @@ def oddiwire_request(path, params=None):
             timeout=20,
         )
 
-        # 只打印状态和响应内容
-        # 不打印 API Key
+        # 调试日志，不打印 API Key
         print("=" * 60)
         print("ODDIWIRE REQUEST:", path)
         print("ODDIWIRE STATUS:", response.status_code)
@@ -108,7 +107,7 @@ def oddiwire_request(path, params=None):
 
 
 # =========================
-# API Key 状态
+# API 状态
 # =========================
 def get_api_status():
     return oddiwire_request("/v1/me")
@@ -134,23 +133,26 @@ def get_fixtures(event_type="live", limit=10):
 # 提取赛事
 # =========================
 def extract_fixtures(data):
-    print(
-        "FIXTURE DATA TYPE:",
-        type(data).__name__,
-    )
+    print("FIXTURE DATA TYPE:", type(data).__name__)
 
+    # Oddiwire 偶尔可能直接返回数组
     if isinstance(data, list):
         print("FIXTURE LIST COUNT:", len(data))
         return data
 
     if isinstance(data, dict):
-
         print(
             "FIXTURE TOP LEVEL KEYS:",
             list(data.keys()),
         )
 
+        # Oddiwire 当前实际返回：
+        # {
+        #     "count": ...,
+        #     "events": [...]
+        # }
         for key in (
+            "events",
             "fixtures",
             "data",
             "results",
@@ -165,21 +167,18 @@ def extract_fixtures(data):
                 )
                 return value
 
-            # 有些 API 会 data -> fixtures
             if isinstance(value, dict):
-
                 for subkey in (
+                    "events",
                     "fixtures",
                     "results",
                     "items",
-                    "events",
                 ):
                     subvalue = value.get(subkey)
 
                     if isinstance(subvalue, list):
                         print(
-                            f"FIXTURE LIST FOUND: "
-                            f"{key}.{subkey}",
+                            f"FIXTURE LIST FOUND: {key}.{subkey}",
                             len(subvalue),
                         )
                         return subvalue
@@ -192,15 +191,16 @@ def extract_fixtures(data):
 # 格式化单场比赛
 # =========================
 def format_fixture(fixture):
-    sport = fixture.get(
-        "sport",
-        fixture.get("game", "ESPORTS"),
+    if not isinstance(fixture, dict):
+        return ""
+
+    sport = (
+        fixture.get("sport")
+        or fixture.get("game")
+        or "ESPORTS"
     )
 
-    competition = fixture.get(
-        "competition",
-        {},
-    )
+    competition = fixture.get("competition", {})
 
     if isinstance(competition, dict):
         league = (
@@ -209,20 +209,14 @@ def format_fixture(fixture):
             or "未知赛事"
         )
     else:
-        league = str(
-            competition or "未知赛事"
-        )
+        league = str(competition or "未知赛事")
 
-    competitors = fixture.get(
-        "competitors",
-        [],
-    )
+    competitors = fixture.get("competitors", [])
 
     team1 = "队伍A"
     team2 = "队伍B"
 
     if isinstance(competitors, list):
-
         if len(competitors) >= 1:
             first = competitors[0]
 
@@ -232,6 +226,8 @@ def format_fixture(fixture):
                     or first.get("title")
                     or team1
                 )
+            else:
+                team1 = str(first)
 
         if len(competitors) >= 2:
             second = competitors[1]
@@ -242,6 +238,8 @@ def format_fixture(fixture):
                     or second.get("title")
                     or team2
                 )
+            else:
+                team2 = str(second)
 
     phase = fixture.get("phase", "")
     status = fixture.get("status", "")
@@ -261,23 +259,18 @@ def format_fixture(fixture):
 
     if status:
         text += (
-            f"📊 "
+            f"📊 状态："
             f"{html.escape(str(status))}\n"
         )
 
-    markets = fixture.get(
-        "markets",
-        [],
-    )
+    markets = fixture.get("markets", [])
 
     if isinstance(markets, list) and markets:
-
         text += "\n💹 <b>赔率盘口</b>\n"
 
         shown = 0
 
         for market in markets:
-
             if shown >= 3:
                 break
 
@@ -291,15 +284,9 @@ def format_fixture(fixture):
                 or "盘口"
             )
 
-            selections = market.get(
-                "selections",
-                [],
-            )
+            selections = market.get("selections", [])
 
-            if not isinstance(
-                selections,
-                list,
-            ):
+            if not isinstance(selections, list):
                 continue
 
             if not selections:
@@ -307,16 +294,11 @@ def format_fixture(fixture):
 
             text += (
                 f"\n• "
-                f"{html.escape(str(market_name))}"
-                f"\n"
+                f"{html.escape(str(market_name))}\n"
             )
 
             for selection in selections[:4]:
-
-                if not isinstance(
-                    selection,
-                    dict,
-                ):
+                if not isinstance(selection, dict):
                     continue
 
                 side = (
@@ -340,8 +322,7 @@ def format_fixture(fixture):
                         f"{html.escape(str(side))}"
                         f"{html.escape(str(line_text))}"
                         f"  @ "
-                        f"{html.escape(str(price))}"
-                        f"\n"
+                        f"{html.escape(str(price))}\n"
                     )
 
             shown += 1
@@ -416,7 +397,7 @@ async def show_api_status(query):
         "━━━━━━━━━━━━━━\n\n"
         "🔑 API Key：已识别\n"
         "🌐 API：正常响应\n\n"
-        "现在可以测试实时比赛和赛前比赛。"
+        "现在可以查询实时比赛和赛前比赛。"
     )
 
     await query.edit_message_text(
@@ -457,11 +438,9 @@ async def show_fixtures(
 
     if not fixtures:
         await query.edit_message_text(
-            "📭 <b>接口连接成功，但没有解析到赛事</b>\n\n"
-            "这不一定代表没有比赛。\n"
-            "Railway 日志已经记录 Oddiwire "
-            "实际返回的数据结构，"
-            "我们可以据此继续调整。",
+            "📭 <b>当前没有找到对应赛事</b>\n\n"
+            "Oddiwire API 已正常连接，"
+            "可以稍后点击刷新重新查询。",
             parse_mode="HTML",
             reply_markup=main_keyboard(),
         )
@@ -478,8 +457,11 @@ async def show_fixtures(
     )
 
     for fixture in fixtures[:5]:
-        text += format_fixture(fixture)
-        text += "\n━━━━━━━━━━━━━━\n"
+        fixture_text = format_fixture(fixture)
+
+        if fixture_text:
+            text += fixture_text
+            text += "\n━━━━━━━━━━━━━━\n"
 
     if len(text) > 3900:
         text = (
@@ -495,7 +477,7 @@ async def show_fixtures(
 
 
 # =========================
-# 按钮
+# 按钮回调
 # =========================
 async def callback(
     update: Update,
@@ -504,32 +486,27 @@ async def callback(
     query = update.callback_query
 
     if query.data == "live":
-
         await show_fixtures(
             query,
             "live",
         )
 
     elif query.data == "prematch":
-
         await show_fixtures(
             query,
             "prematch",
         )
 
     elif query.data == "hot":
-
         await show_fixtures(
             query,
             "live",
         )
 
     elif query.data == "api_status":
-
         await show_api_status(query)
 
     elif query.data == "about":
-
         await query.answer()
 
         text = (
@@ -538,7 +515,7 @@ async def callback(
             "⚡ 电竞赛事数据\n"
             "📊 实时赔率盘口\n"
             "🎯 赛前与滚球赛事\n\n"
-            "数据接口：Oddiwire\n\n"
+            "📡 数据接口：Oddiwire\n\n"
             "赔率信息仅作数据展示。"
         )
 
@@ -550,10 +527,9 @@ async def callback(
 
 
 # =========================
-# 启动
+# 启动机器人
 # =========================
 def main():
-
     if not ODDIWIRE_API_KEY:
         print(
             "WARNING: "
@@ -583,9 +559,7 @@ def main():
         )
     )
 
-    print(
-        "姜天电竞 Telegram Bot 已启动"
-    )
+    print("姜天电竞 Telegram Bot 已启动")
 
     app.run_polling(
         allowed_updates=Update.ALL_TYPES
